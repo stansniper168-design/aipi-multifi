@@ -1,0 +1,730 @@
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+index 895c9c4..f4a7195 100644
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -72,6 +72,9 @@ if(CONFIG_MUSE_ENABLED)
+     if(CONFIG_MUSE_HATCH)
+         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_options_json.c")
+         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
++        if(CONFIG_MUSE_TTS_GROQ)
++            list(APPEND srcs "muse_tts_groq.c")   # Groq TTS for spoken replies
++        endif()
+         if(CONFIG_MUSE_RESEND_NOTES)
+             list(APPEND srcs "muse_resend.c")   # when a note that didn't send goes again
+         endif()
+diff --git a/esp32/components/muse/Kconfig b/esp32/components/muse/Kconfig
+index 3b7168e..e320167 100644
+--- a/esp32/components/muse/Kconfig
++++ b/esp32/components/muse/Kconfig
+@@ -408,6 +408,21 @@ menu "Muse"
+             the photo isn't kept once it has gone up. Another camera board
+             adds its capture to muse_photo_note.c and to this dependency.
+ 
++    config MUSE_TTS_GROQ
++        bool "Groq text-to-speech for replies"
++        depends on MUSE_HATCH && SPIRAM
++        default y
++        help
++            Speaks replies out loud instead of showing them as silent text.
++            When a voice is configured (endpoint, model and API key, set over
++            the serial console with >voice={...}), each spoken reply's text
++            is POSTed to that OpenAI-shaped /audio/speech endpoint -- Groq's
++            Orpheus by default -- and the returned WAV is played at the
++            speaker's volume. With no voice configured, or when the speaker
++            is off, or when the fetch fails, replies stay silent text exactly
++            as before. The fetch runs on its own task and never blocks the
++            chat session.
++
+     config MUSE_P4_CSI_CAMERA
+         bool "ESP32-P4 MIPI-CSI camera capture"
+         depends on MUSE_BOARD_WAVESHARE_P4_LCD35 && SPIRAM
+diff --git a/esp32/components/muse/muse_chat_priv.h b/esp32/components/muse/muse_chat_priv.h
+index 4e32d29..d2a4b8f 100644
+--- a/esp32/components/muse/muse_chat_priv.h
++++ b/esp32/components/muse/muse_chat_priv.h
+@@ -45,6 +45,17 @@ void muse_hatch_chat_connect(void);
+ /* Drops the connection and the cached VM credentials (settings changed). */
+ void muse_hatch_chat_forget(void);
+ 
++/* Groq TTS feed (muse_tts_groq.c): the fetch task's side of a spoken message.
++ * muse_chat_tts_feed queues `len` PCM bytes for the session task to play and
++ * returns how many were queued, or -1 if the turn moved on (wrong generation
++ * or message). muse_chat_tts_wav_header reports the WAV format of the stream
++ * (the first chunk's); muse_chat_tts_end reports the fetch finished, ok when
++ * every chunk arrived. muse_chat_tts_alive is the fetch task's liveness check. */
++int muse_chat_tts_feed(uint32_t gen, int msg, const uint8_t *data, size_t len);
++void muse_chat_tts_wav_header(uint32_t gen, int msg, uint32_t rate, uint16_t channels, uint16_t bits);
++void muse_chat_tts_end(uint32_t gen, int msg, bool ok);
++bool muse_chat_tts_alive(uint32_t gen, int msg);
++
+ /* Keep rejected IDs for the turn: later events may omit their parent.
+  * On overflow, require a known parent for new messages. */
+ #define MUSE_CHAT_REJECTED_MAX 8
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index 760555d..7ffde3a 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -79,6 +79,7 @@ extern "C" {
+ #include "muse_account_api.h"
+ #include "muse_link.h"
+ #include "muse_settings.h"
++#include "muse_tts_groq.h"
+ #include "muse_wifi.h"
+ }
+ #include "muse_chat_priv.h"
+@@ -125,6 +126,7 @@ static const char *TAG = "muse_chat_session";
+ #define MP3_HOLD (1441 + 4)               /* the largest MP3 frame and the next header */
+ #define MP3_POLL_ROOM (SCRATCH + 8192)     /* stop reading the socket below this much MP3 room */
+ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP3 buffer empty");
++#define MUSE_TTS_PCM_BYTES (64 * 1024) /* Groq TTS: fetched PCM waiting to play (~0.7 s at 48 kHz) */
+ #define EV_TEXT 72
+ #define CAPTION_TEXT 1024                  /* a message's text, for captions timed to its speech */
+ #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER || CONFIG_MUSE_LATEST_REPLY
+@@ -301,6 +303,9 @@ struct turn_t {
+     resampler_t down;
+     int kbps;
+     int down_rate;
++#if CONFIG_MUSE_TTS_GROQ
++    bool wav; /* this message speaks WAV (Groq TTS), not MP3; session task only */
++#endif
+     bool detached;           /* the reply is slow: a notice is said, the turn ends, the reply starts another */
+     bool incoming;           /* plays a reply to a request that outlived its turn */
+ #if CONFIG_MUSE_PHOTO_NOTES
+@@ -348,6 +353,19 @@ static bool open_note(void);
+ static void log_marks(void);
+ static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
+ static int16_t *s_pcm16;     /* resampled output */
++#if CONFIG_MUSE_TTS_GROQ
++/* Groq TTS cross-task state (muse_tts_groq.c): the fetch task writes the
++ * atomics, the session task reads them. The PCM stream buffer carries the
++ * fetched audio; the session task is its only reader. */
++static std::atomic<bool> s_tts_failed{false}; /* the fetch gave up: fall back to silence */
++static std::atomic<uint32_t> s_tts_gen{0};    /* fetch generation: bumps per message */
++static std::atomic<bool> s_tts_ended{false};  /* the fetch finished (ok or failed) */
++static std::atomic<bool> s_tts_wav_header_seen{false};
++static std::atomic<uint32_t> s_tts_wav_rate{0};
++static std::atomic<uint16_t> s_tts_wav_channels{1};
++static std::atomic<uint16_t> s_tts_wav_bits{16};
++static StreamBufferHandle_t s_tts_pcm; /* fetched PCM bytes waiting to play */
++#endif
+ static int64_t s_last_seq;
+ static int64_t s_last_row_seq;   /* message rows are numbered in the chat's own order, apart from live events */
+ 
+@@ -2135,6 +2153,24 @@ static void on_chat_ack(stream_t *s)
+ static void start_tts(void)
+ {
+     if (s_turn.tts_msg >= 0) {
++#if CONFIG_MUSE_TTS_GROQ
++        /* The Groq fetch failed after the message started: fall back to
++         * silent text for the rest of it, paced over the text estimate.
++         * (When some audio already played, decode_wav() finishes the message
++         * instead, so this only fires when nothing was spoken yet.) */
++        if (s_turn.wav && s_tts_failed.load()) {
++            s_tts_failed.store(false);
++            if (s_tts_pcm) {
++                xStreamBufferReset(s_tts_pcm);
++            }
++            msg_t &m = s_turn.msgs[s_turn.tts_msg];
++            if (s_turn.pcm_out - m.pcm_start > m.pcm_frames) {
++                m.pcm_frames = s_turn.pcm_out - m.pcm_start;
++            }
++            s_turn.wav = false;
++            s_turn.silent = true;
++        }
++#endif
+         return;
+     }
+     for (int i = 0; i < s_turn.nmsgs; i++) {
+@@ -2142,29 +2178,38 @@ static void start_tts(void)
+         if (m.tts != TTS_QUEUED) {
+             continue;
+         }
+-        /*
+-         * Replies are text, shown at reading pace: silence in place of speech
+-         * paces the captions and ends the turn. To speak them instead, send
+-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
+-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
+-         * play the MP3 it returns. In place of the silence below: keep
+-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
+-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
+-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
+-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
+-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
+-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
+-         * end. decode() plays it at the speaker's volume, captions following,
+-         * and finishes the message once it's drained.
+-         */
+         m.pcm_start = s_turn.pcm_out;
+         /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
+          * was kept at reading pace, not stretched over the whole reply's time
+-         * (the Watcher keeps the rest for review). */
++         * (the Watcher keeps the rest for review). The estimate also paces
++         * the silent fallback when a Groq fetch fails. */
+         size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
+         m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+         m.tts = TTS_ACTIVE;
+         s_turn.tts_msg = i;
++#if CONFIG_MUSE_TTS_GROQ
++        /* Speak it when a voice is configured and the speaker is on: the
++         * fetch runs on its own task (muse_tts_groq.c) and streams WAV back.
++         * Anything else -- no voice, speaker off or muted, no text kept, no
++         * PCM buffer, or the task won't start -- stays silent text, paced
++         * over the estimate as before. */
++        s_turn.wav = false;
++        s_tts_failed.store(false);
++        s_tts_ended.store(false);
++        s_tts_wav_header_seen.store(false);
++        if (muse_tts_voice_configured() && muse_settings_speaker_on() && muse_settings_volume() > 0 &&
++            s_turn.texts && s_tts_pcm) {
++            uint32_t gen = s_tts_gen.fetch_add(1) + 1;
++            if (muse_tts_groq_start(i, s_turn.texts + i * TEXT_MAX, gen)) {
++                s_turn.wav = true;
++                s_turn.silent = false;
++                s_turn.kbps = 0;
++                ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
++                show_reply_start(m);
++                return;
++            }
++        }
++#endif
+         s_turn.silent = true;
+         ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+         show_reply_start(m);
+@@ -2198,6 +2243,50 @@ static void tts_end(stream_t *s, bool ok)
+     }
+ }
+ 
++#if CONFIG_MUSE_TTS_GROQ
++/* ---- Groq TTS feed (muse_tts_groq.c) ---- */
++/*
++ * The fetch task's side of a spoken message. These check the generation and
++ * the message before touching anything, so a fetch that outlives its turn
++ * (the turn moved on while a chunk was in flight) is ignored instead of
++ * feeding the next message's audio.
++ */
++int muse_chat_tts_feed(uint32_t gen, int msg, const uint8_t *data, size_t len)
++{
++    if (!s_tts_pcm || gen != s_tts_gen.load() || msg != s_turn.tts_msg || !s_turn.wav) {
++        return -1;
++    }
++    return (int)xStreamBufferSend(s_tts_pcm, data, len, 0);
++}
++
++void muse_chat_tts_wav_header(uint32_t gen, int msg, uint32_t rate, uint16_t channels, uint16_t bits)
++{
++    if (gen != s_tts_gen.load() || msg != s_turn.tts_msg || !s_turn.wav) {
++        return;
++    }
++    s_tts_wav_rate.store(rate);
++    s_tts_wav_channels.store(channels);
++    s_tts_wav_bits.store(bits);
++    s_tts_wav_header_seen.store(true);
++}
++
++void muse_chat_tts_end(uint32_t gen, int msg, bool ok)
++{
++    if (gen != s_tts_gen.load() || msg != s_turn.tts_msg || !s_turn.wav) {
++        return;
++    }
++    if (!ok) {
++        s_tts_failed.store(true);
++    }
++    s_tts_ended.store(true);
++}
++
++bool muse_chat_tts_alive(uint32_t gen, int msg)
++{
++    return gen == s_tts_gen.load() && msg == s_turn.tts_msg && s_turn.wav;
++}
++#endif
++
+ /* Speaker off: queues the shown message's silence while the reply buffer has room. */
+ static void pace_silently(void)
+ {
+@@ -2218,6 +2307,103 @@ static void pace_silently(void)
+ }
+ 
+ /* Decodes buffered MP3 while the reply buffer has room. */
++#if CONFIG_MUSE_TTS_GROQ
++/* Plays fetched WAV PCM (Groq/Orpheus) from the fetch task's stream buffer:
++ * mono-convert, resample to the speaker's 16 kHz, push to s_out. The resampler
++ * needs out to hold n*out/in + 2, so each batch is capped by both the
++ * resampled output buffer and the speaker room left. */
++static void decode_wav(void)
++{
++    if (!s_tts_wav_header_seen.load() || !s_tts_pcm) {
++        return;
++    }
++    uint32_t rate = s_tts_wav_rate.load();
++    uint16_t channels = s_tts_wav_channels.load();
++    uint16_t bits = s_tts_wav_bits.load();
++    size_t frame_bytes = (size_t)channels * (bits / 8);
++    if (!rate || !frame_bytes) {
++        return;
++    }
++    uint8_t raw[2048]; /* one conversion batch of raw PCM */
++    while (xStreamBufferSpacesAvailable(s_out) >= 64 * sizeof(int16_t)) {
++        size_t avail = xStreamBufferBytesAvailable(s_tts_pcm);
++        if (avail < frame_bytes) {
++            break;
++        }
++        size_t take = avail / frame_bytes;
++        size_t room = xStreamBufferSpacesAvailable(s_out) / sizeof(int16_t);
++        size_t max_out = room < (size_t)(MINIMP3_MAX_SAMPLES_PER_FRAME + 8)
++                             ? room
++                             : (size_t)(MINIMP3_MAX_SAMPLES_PER_FRAME + 8);
++        if (max_out > 2) {
++            size_t by_out = (max_out - 2) * rate / MIC_RATE;
++            if (take > by_out) {
++                take = by_out;
++            }
++        } else {
++            take = 0;
++        }
++        if (take > (size_t)MINIMP3_MAX_SAMPLES_PER_FRAME) {
++            take = MINIMP3_MAX_SAMPLES_PER_FRAME;
++        }
++        size_t bytes = take * frame_bytes;
++        if (bytes > sizeof(raw)) {
++            take = sizeof(raw) / frame_bytes;
++            bytes = take * frame_bytes;
++        }
++        if (!take) {
++            break;
++        }
++        size_t got = xStreamBufferReceive(s_tts_pcm, raw, bytes, 0);
++        size_t frames = got / frame_bytes;
++        if (!frames) {
++            break;
++        }
++        if (bits == 16) {
++            const int16_t *in = (const int16_t *)raw;
++            if (channels == 2) {
++                for (size_t k = 0; k < frames; k++) {
++                    s_pcm[k] = (int16_t)((in[2 * k] + in[2 * k + 1]) / 2);
++                }
++            } else {
++                memcpy(s_pcm, in, frames * sizeof(int16_t));
++            }
++        } else { /* 8-bit unsigned */
++            if (channels == 2) {
++                for (size_t k = 0; k < frames; k++) {
++                    s_pcm[k] = (int16_t)(((int16_t)(raw[2 * k] - 128) + (int16_t)(raw[2 * k + 1] - 128)) * 128);
++                }
++            } else {
++                for (size_t k = 0; k < frames; k++) {
++                    s_pcm[k] = (int16_t)(((int16_t)raw[k] - 128) * 256);
++                }
++            }
++        }
++        if (s_turn.down_rate != (int)rate) {
++            ESP_LOGI(TAG, "reply audio: %u Hz, %u ch, WAV", rate, channels);
++            s_turn.down_rate = (int)rate;
++            resampler_init(&s_turn.down, (int)rate, MIC_RATE);
++        }
++        size_t n = resample(&s_turn.down, s_pcm, frames, s_pcm16);
++        if (s_turn.gen == s_gen.load()) {
++            mark(M_AUDIO);
++            xStreamBufferSend(s_out, s_pcm16, n * sizeof(int16_t), 0);
++        }
++        s_turn.pcm_out += n;
++    }
++    if (s_tts_ended.load() && !xStreamBufferBytesAvailable(s_tts_pcm)) {
++        msg_t &m = s_turn.msgs[s_turn.tts_msg];
++        if (s_tts_failed.load() && s_turn.pcm_out == m.pcm_start) {
++            return; /* nothing spoken: start_tts() falls back to silent text */
++        }
++        m.pcm_end = s_turn.pcm_out;
++        m.pcm_frames = s_turn.pcm_out - m.pcm_start;
++        m.tts = TTS_FINISHED;
++        s_turn.tts_msg = -1;
++    }
++}
++#endif
++
+ static void decode(void)
+ {
+     if (s_turn.tts_msg < 0) {
+@@ -2227,6 +2413,12 @@ static void decode(void)
+         pace_silently();
+         return;
+     }
++#if CONFIG_MUSE_TTS_GROQ
++    if (s_turn.wav) {
++        decode_wav();
++        return;
++    }
++#endif
+     /*
+      * minimp3 only takes a frame once it can see the next one's header. Given
+      * less, it resets and says to skip all of it, which drops speech and clicks.
+@@ -2863,6 +3055,14 @@ extern "C" void muse_hatch_start(void)
+      * halfway through a sample. */
+     s_in = xStreamBufferCreateWithCaps(IN_BYTES + 1, 1, MALLOC_CAP_SPIRAM);
+     s_out = xStreamBufferCreateWithCaps(OUT_BYTES, 1, MALLOC_CAP_SPIRAM);
++#if CONFIG_MUSE_TTS_GROQ
++    /* Spoken replies (Groq): fetched PCM waiting to play. Optional: if it
++     * can't be made, the voice stays off and replies stay silent text. */
++    s_tts_pcm = xStreamBufferCreateWithCaps(MUSE_TTS_PCM_BYTES, 1, MALLOC_CAP_SPIRAM);
++    if (!s_tts_pcm) {
++        ESP_LOGW(TAG, "TTS PCM buffer failed; spoken replies off");
++    }
++#endif
+     s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
+     s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
+     s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
+diff --git a/esp32/components/muse/muse_settings.c b/esp32/components/muse/muse_settings.c
+index d768c99..ae71cb3 100644
+--- a/esp32/components/muse/muse_settings.c
++++ b/esp32/components/muse/muse_settings.c
+@@ -30,6 +30,9 @@
+ #endif
+ 
+ #include "muse_link.h"
++#if CONFIG_MUSE_TTS_GROQ
++#include "muse_tts_groq.h" /* the default voice when none is stored */
++#endif
+ 
+ static const char *TAG = "muse_settings";
+ 
+@@ -52,6 +55,12 @@ static struct {
+     char host[MUSE_HOST_MAX + 1];
+     char vm[MUSE_VM_MAX + 1];
+     char token[MUSE_TOKEN_MAX + 1];
++#if CONFIG_MUSE_TTS_GROQ
++    char tts_url[MUSE_TTS_URL_MAX + 1];
++    char tts_model[MUSE_TTS_MODEL_MAX + 1];
++    char tts_voice[MUSE_TTS_VOICE_MAX + 1];
++    char tts_key[MUSE_TTS_KEY_MAX + 1];
++#endif
+ } s = {
+     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
+     .speaker_on = true,
+@@ -195,6 +204,16 @@ esp_err_t muse_settings_init(void)
+     load_str("host", s.host, sizeof(s.host));
+     load_str("vm", s.vm, sizeof(s.vm));
+     load_str("token", s.token, sizeof(s.token));
++#if CONFIG_MUSE_TTS_GROQ
++    load_str("tts_url", s.tts_url, sizeof(s.tts_url));
++    load_str("tts_model", s.tts_model, sizeof(s.tts_model));
++    load_str("tts_voice", s.tts_voice, sizeof(s.tts_voice));
++    load_str("tts_key", s.tts_key, sizeof(s.tts_key));
++    /* A half-saved or non-https voice stays off rather than failing at speech time. */
++    if (strncmp(s.tts_url, "https://", 8) || !s.tts_model[0] || !s.tts_key[0]) {
++        s.tts_url[0] = s.tts_model[0] = s.tts_voice[0] = s.tts_key[0] = '\0';
++    }
++#endif
+ 
+     s.volume = clampi(s.volume, 0, 100);
+     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
+@@ -334,6 +353,42 @@ size_t muse_settings_hatch_token_len(void)
+     return n;
+ }
+ 
++#if CONFIG_MUSE_TTS_GROQ
++bool muse_settings_tts_configured(void)
++{
++    bool ok;
++    LOCKED(ok = strncmp(s.tts_url, "https://", 8) == 0 && s.tts_model[0] && s.tts_key[0]);
++    return ok;
++}
++
++void muse_settings_tts(char url[MUSE_TTS_URL_MAX + 1], char model[MUSE_TTS_MODEL_MAX + 1],
++                       char voice[MUSE_TTS_VOICE_MAX + 1], char key[MUSE_TTS_KEY_MAX + 1])
++{
++    LOCKED({
++        strlcpy(url, s.tts_url, MUSE_TTS_URL_MAX + 1);
++        strlcpy(model, s.tts_model, MUSE_TTS_MODEL_MAX + 1);
++        strlcpy(voice, s.tts_voice[0] ? s.tts_voice : MUSE_TTS_GROQ_VOICE, MUSE_TTS_VOICE_MAX + 1);
++        strlcpy(key, s.tts_key, MUSE_TTS_KEY_MAX + 1);
++    });
++}
++
++void muse_settings_set_tts(const char *url, const char *model, const char *voice, const char *key)
++{
++    LOCKED({
++        strlcpy(s.tts_url, url ? url : "", sizeof(s.tts_url));
++        strlcpy(s.tts_model, model ? model : "", sizeof(s.tts_model));
++        strlcpy(s.tts_voice, voice ? voice : "", sizeof(s.tts_voice));
++        strlcpy(s.tts_key, key ? key : "", sizeof(s.tts_key));
++        save_str("tts_url", s.tts_url);
++        save_str("tts_model", s.tts_model);
++        save_str("tts_voice", s.tts_voice);
++        save_str("tts_key", s.tts_key);
++    });
++    /* No listener notification: the fetch task reads the settings fresh for
++     * every message, and no hardware applies a voice change. */
++}
++#endif
++
+ void muse_settings_set_volume(int pct)
+ {
+     s.volume = clampi(pct, 0, 100);
+diff --git a/esp32/components/muse/muse_settings.h b/esp32/components/muse/muse_settings.h
+index 28e06ef..5992de7 100644
+--- a/esp32/components/muse/muse_settings.h
++++ b/esp32/components/muse/muse_settings.h
+@@ -41,6 +41,12 @@
+ #define MUSE_HOST_MAX 63
+ #define MUSE_VM_MAX 63
+ #define MUSE_TOKEN_MAX 1023
++/* Groq text-to-speech (muse_tts_groq.c): the OpenAI-shaped speech endpoint,
++ * model and voice, and the API key. The key is never printed anywhere. */
++#define MUSE_TTS_URL_MAX 128
++#define MUSE_TTS_MODEL_MAX 64
++#define MUSE_TTS_VOICE_MAX 32
++#define MUSE_TTS_KEY_MAX 128
+ 
+ #define MUSE_MIC_GAIN_MAX 36      /* dB; ES7210 PGA, applied in 3 dB steps */
+ 
+@@ -120,6 +126,17 @@ void muse_settings_hatch_vm(char out[MUSE_VM_MAX + 1]);
+ void muse_settings_hatch_token(char out[MUSE_TOKEN_MAX + 1]);
+ size_t muse_settings_hatch_token_len(void);
+ 
++/* Groq text-to-speech voice (muse_tts_groq.c). Configured means an https URL,
++ * a model and a key are all set; with nothing configured, replies stay
++ * silent text. `muse_settings_tts` copies all four fields out at once so a
++ * fetch task sees a consistent set. */
++#if CONFIG_MUSE_TTS_GROQ
++bool muse_settings_tts_configured(void);
++void muse_settings_tts(char url[MUSE_TTS_URL_MAX + 1], char model[MUSE_TTS_MODEL_MAX + 1],
++                       char voice[MUSE_TTS_VOICE_MAX + 1], char key[MUSE_TTS_KEY_MAX + 1]);
++void muse_settings_set_tts(const char *url, const char *model, const char *voice, const char *key);
++#endif
++
+ void muse_settings_set_volume(int pct);
+ void muse_settings_set_speaker_on(bool on);
+ void muse_settings_set_mic_gain(int db);
+diff --git a/esp32/main/sdk_token_console.c b/esp32/main/sdk_token_console.c
+index 0a958c0..2cdf186 100644
+--- a/esp32/main/sdk_token_console.c
++++ b/esp32/main/sdk_token_console.c
+@@ -36,6 +36,11 @@
+ #if CONFIG_MUSE_ENABLED
+ #include "muse_link.h"
+ #endif
++#if CONFIG_MUSE_TTS_GROQ
++#include "cJSON.h"
++#include "muse_settings.h"
++#include "muse_tts_groq.h"
++#endif
+ #include "token_fp.h"
+ 
+ // The chip's own USB port, where it has one and the log goes to it.
+@@ -111,8 +116,50 @@ done:
+     return true;
+ }
+ 
++#if CONFIG_MUSE_TTS_GROQ
++// Groq text-to-speech voice: >voice={"url":...,"model":...,"voice":...,"key":...}
++// saves the voice; >voice= with no body (or {}) prints the status. The key is
++// never printed: the status only says whether one is set. (The line buffer is
++// wiped by feed() after the command runs, as with the SDK token.)
++static bool voice_command(const char *line) {
++    const char *prefix = "voice=";
++    if (strncmp(line, prefix, strlen(prefix))) return false;
++    char url[MUSE_TTS_URL_MAX + 1], model[MUSE_TTS_MODEL_MAX + 1];
++    char voice[MUSE_TTS_VOICE_MAX + 1], key[MUSE_TTS_KEY_MAX + 1];
++    int rc = muse_tts_groq_parse_voice_cmd(line + strlen(prefix), url, sizeof(url), model, sizeof(model),
++                                           voice, sizeof(voice), key, sizeof(key));
++    const char *result = "error invalid";
++    if (rc == 0) {
++        muse_settings_set_tts(url, model, voice, key);
++        result = "saved";
++    } else if (rc == 1) {
++        muse_settings_tts(url, model, voice, key);
++        // Status deliberately excludes the key itself.
++        cJSON *status = cJSON_CreateObject();
++        bool built = status && cJSON_AddStringToObject(status, "url", url) &&
++                     cJSON_AddStringToObject(status, "model", model) &&
++                     cJSON_AddStringToObject(status, "voice", voice) &&
++                     cJSON_AddBoolToObject(status, "key_set", key[0] != 0) &&
++                     cJSON_AddBoolToObject(status, "configured", muse_settings_tts_configured());
++        char *text = built ? cJSON_PrintUnformatted(status) : NULL;
++        if (text) printf("@voice %s\n", text);
++        else printf("@voice error memory\n");
++        cJSON_free(text);
++        cJSON_Delete(status);
++        result = NULL;
++    }
++    network_proxy_wipe(key, sizeof(key));
++    if (result) printf("@voice %s\n", result);
++    fflush(stdout);
++    return true;
++}
++#endif
++
+ bool sdk_token_console_command(const char *line) {
+     if (proxy_command(line)) return true;
++#if CONFIG_MUSE_TTS_GROQ
++    if (voice_command(line)) return true;
++#endif
+     if (strncmp(line, COMMAND, strlen(COMMAND)) != 0) return false;
+     const char *token = line + strlen(COMMAND);
+     if (!identity_sdk_token_valid(token)) {
+diff --git a/esp32/tests/test_muse_chat_session.py b/esp32/tests/test_muse_chat_session.py
+index f524594..4d06cd2 100644
+--- a/esp32/tests/test_muse_chat_session.py
++++ b/esp32/tests/test_muse_chat_session.py
+@@ -66,6 +66,32 @@ class ChatSession(unittest.TestCase):
+ #endif
+ #define ESP_LOGI(...) ((void)0)
+ #define ESP_LOGW(...) ((void)0)
++#include "muse_tts_groq.h"
++/* Groq TTS (start_tts's voice branch): the fetch task is stubbed out, and the
++ * cross-task state it would write lives here so the launch and the fail
++ * fallback can be exercised. */
++typedef void *StreamBufferHandle_t;
++static void xStreamBufferReset(void *) {}
++static std::atomic<bool> s_tts_failed{false};
++static std::atomic<uint32_t> s_tts_gen{0};
++static std::atomic<bool> s_tts_ended{false};
++static std::atomic<bool> s_tts_wav_header_seen{false};
++static StreamBufferHandle_t s_tts_pcm;
++static bool tts_speaker_on = true;
++static int tts_speaker_volume = 100;
++static bool muse_settings_speaker_on(void) { return tts_speaker_on; }
++static int muse_settings_volume(void) { return tts_speaker_volume; }
++static bool tts_configured;
++static int tts_started_msg = -1;
++static uint32_t tts_started_gen;
++static bool tts_start_ok = true;
++bool muse_tts_voice_configured(void) { return tts_configured; }
++bool muse_tts_groq_start(int msg, const char *text, uint32_t gen) {
++    tts_started_msg = msg;
++    tts_started_gen = gen;
++    (void)text;
++    return tts_start_ok;
++}
+ ''' + constants + types + r'''
+ static turn_t s_turn;
+ static pending_t s_pending;
+@@ -255,6 +281,77 @@ static void paced_to_the_kept_text() {
+     assert(s_turn.msgs[0].pcm_frames == (uint32_t)(11 * MIC_RATE / TEXT_CHARS_PER_S));
+     s_turn.texts = nullptr;
+ }
++/* Groq TTS: a voice reply starts a fetch when a voice is configured and the
++ * speaker is on; otherwise it stays silent text, paced as before. */
++static void tts_setup(bool configured, bool speaker_on, int volume, bool start_ok) {
++    tts_configured = configured;
++    tts_speaker_on = speaker_on;
++    tts_speaker_volume = volume;
++    tts_start_ok = start_ok;
++    tts_started_msg = -1;
++    tts_started_gen = 0;
++    s_tts_pcm = (StreamBufferHandle_t)1; /* the fetch has somewhere to feed */
++    s_tts_failed = false;
++    s_tts_ended = false;
++    s_tts_wav_header_seen = false;
++}
++static void voice_reply_starts_fetch() {
++    tts_setup(true, true, 100, true);
++    const char *kept = voice_reply({"Hello there"});
++    start_tts();
++    const msg_t &m = s_turn.msgs[0];
++    assert(m.tts == TTS_ACTIVE && s_turn.tts_msg == 0 && s_turn.wav && !s_turn.silent);
++    assert(tts_started_msg == 0 && tts_started_gen > 0);
++    assert(strlen(kept) == 11);
++    s_turn.texts = nullptr;
++}
++static void voice_reply_silent_without_voice() {
++    tts_setup(false, true, 100, true);
++    voice_reply({"Hello there"});
++    start_tts();
++    assert(s_turn.tts_msg == 0 && !s_turn.wav && s_turn.silent && tts_started_msg == -1);
++    s_turn.texts = nullptr;
++}
++static void voice_reply_silent_when_speaker_off() {
++    tts_setup(true, false, 100, true);
++    voice_reply({"Hello there"});
++    start_tts();
++    assert(s_turn.tts_msg == 0 && !s_turn.wav && s_turn.silent && tts_started_msg == -1);
++    s_turn.texts = nullptr;
++}
++static void voice_reply_silent_when_muted() {
++    tts_setup(true, true, 0, true);
++    voice_reply({"Hello there"});
++    start_tts();
++    assert(s_turn.tts_msg == 0 && !s_turn.wav && s_turn.silent && tts_started_msg == -1);
++    s_turn.texts = nullptr;
++}
++static void voice_reply_silent_when_fetch_wont_start() {
++    tts_setup(true, true, 100, false);
++    voice_reply({"Hello there"});
++    start_tts();
++    assert(s_turn.tts_msg == 0 && !s_turn.wav && s_turn.silent);
++    assert(tts_started_msg == 0); /* it tried, then fell back to silence */
++    s_turn.texts = nullptr;
++}
++static void failed_fetch_falls_back_to_silence() {
++    tts_setup(true, true, 100, true);
++    voice_reply({"Hello there"});
++    start_tts();
++    assert(s_turn.wav && !s_turn.silent);
++    s_tts_failed = true; /* the fetch task's muse_chat_tts_end(gen, msg, false) */
++    start_tts();
++    assert(!s_turn.wav && s_turn.silent && !s_tts_failed.load());
++    assert(s_turn.msgs[0].tts == TTS_ACTIVE && s_turn.tts_msg == 0);
++    s_turn.texts = nullptr;
++}
++static void typed_reply_never_starts_fetch() {
++    tts_setup(true, true, 100, true);
++    begin(true);
++    event("message.assistant", "typed", "note", "Typed reply");
++    start_tts();
++    assert(s_turn.tts_msg == -1 && tts_started_msg == -1);
++}
+ static void capped_voice(bool partial) {
+     begin();
+     s_turn.agent_busy = true;
+@@ -840,6 +937,13 @@ int main(int argc, char **argv) {
+     case 28: others_status_and_late_play(); break;
+     case 29: chained_and_mid_stream_replies(); break;
+     case 30: late_rows_by_their_own_order_and_content(); break;
++    case 43: voice_reply_starts_fetch(); break;
++    case 44: voice_reply_silent_without_voice(); break;
++    case 45: voice_reply_silent_when_speaker_off(); break;
++    case 46: voice_reply_silent_when_muted(); break;
++    case 47: voice_reply_silent_when_fetch_wont_start(); break;
++    case 48: failed_fetch_falls_back_to_silence(); break;
++    case 49: typed_reply_never_starts_fetch(); break;
+     case 31: {
+         muse_options_clear();
+         s_turn.phase = P_IDLE;
+@@ -892,7 +996,7 @@ int main(int argc, char **argv) {
+ }
+ '''
+         (out / 'session.cpp').write_text(code)
+-        flags = ['-Wall', '-Wextra', '-Werror', '-I', str(JSON),
++        flags = ['-Wall', '-Wextra', '-Werror', '-DCONFIG_MUSE_TTS_GROQ=1', '-I', str(JSON),
+                  '-I', str(ROOT / 'tests'), '-I', str(ROOT / 'components/muse'),
+                  '-I', str(ROOT / 'components/minimp3/include')]
+         commands = [
+@@ -969,6 +1073,27 @@ int main(int argc, char **argv) {
+     def test_long_reply_is_paced_to_the_text_kept(self):
+         self.run_case(5)
+ 
++    def test_voice_reply_starts_fetch_when_configured(self):
++        self.run_case(43)
++
++    def test_voice_reply_silent_without_voice(self):
++        self.run_case(44)
++
++    def test_voice_reply_silent_when_speaker_off(self):
++        self.run_case(45)
++
++    def test_voice_reply_silent_when_muted(self):
++        self.run_case(46)
++
++    def test_voice_reply_silent_when_fetch_wont_start(self):
++        self.run_case(47)
++
++    def test_failed_fetch_falls_back_to_silence(self):
++        self.run_case(48)
++
++    def test_typed_reply_never_starts_fetch(self):
++        self.run_case(49)
++
+     def test_busy_voice_without_messages_fails_at_cap(self):
+         self.run_case(6)
+ 

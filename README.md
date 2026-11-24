@@ -28,6 +28,9 @@ Tested 2026-11-23 on a real AIPI Lite (device D4154C), flashed with esptool:
   the toolchain is installed). No SDK token needed at build time — the token
   is read from the device's NVS, and the build warns "No SDK token" on
   purpose.
+- `build-voice.sh` + `voice/` — the same build **plus spoken replies** via
+  Groq TTS (see [Voice (Groq TTS, no OpenAI)](#voice-groq-tts-no-openai)
+  below). No OpenAI anywhere.
 - `flash.bat` + `flasher_args.json` — the build's own flash manifest
   (bootloader 0x0, partition table 0x10000, otadata 0x1d000, app 0x20000).
   After building, copy these two files into `build-muse-aipi/` next to the
@@ -82,6 +85,87 @@ no list. The setup flow is the only way in, and it has a catch:
    Wi-Fi too. The disconnect/remove must be done in the app.
 4. Test it: turn the hotspot off and watch the box hop back to the first
    network on its own. If it answers, the roam works.
+
+## Voice (Groq TTS, no OpenAI)
+
+The open SDK's TTS is a stub, so spoken replies needed a real engine. This
+build speaks through **Groq's Orpheus TTS**
+(`canopylabs/orpheus-v1-english`) via Groq's OpenAI-compatible endpoint
+(`https://api.groq.com/openai/v1/audio/speech`). **No OpenAI anywhere.**
+Orpheus is WAV-only with a 200-character-per-request cap, so replies are
+chunked at sentence boundaries (up to 6 requests for a long reply) and
+played as 16 kHz mono audio. Default voice is `troy`. Free tier is ~100
+requests/day.
+
+**Verified working 2026-11-24 on a real AIPI Lite (device D4154C):** first
+test turn "Say hello to me" → Groq answered HTTP 200, reply audio 24 kHz
+WAV, **3.44 seconds of speech played**. Laptop-side check
+(`voice/groq_test.py`) from the same Wi-Fi: HTTP 200, `audio/wav`, 76,870
+bytes.
+
+**Two blockers found and fixed:**
+
+1. **Cloudflare 1010.** Groq's Cloudflare returns HTTP 403 code 1010 for
+   non-browser User-Agents, and the ESP32 HTTP client's default
+   (`"ESP32 HTTP Client/1.0"`) was blocked at the edge before any HTTP
+   response arrived. Fix: a browser-like User-Agent header
+   (`MUSE_TTS_GROQ_USER_AGENT`, Chrome 120).
+2. **Orpheus terms acceptance.** Groq returns HTTP 400
+   `model_terms_required` until the org admin accepts the Orpheus model
+   terms in the Groq console:
+   https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english
+   — a console step, not firmware. (A bad key would 401, not 400, so this
+   also proves the key is valid.)
+
+The first build also had a diagnostic gap: the fetch died before any HTTP
+response and every pre-response exit was a silent `goto out`. The fix adds
+WARN logging (15 new `ESP_LOGW` lines) naming the stage and error on every
+failure exit, so the serial log now says exactly where a fetch died.
+
+**Build it:** `build-voice.sh` — same pinned stock SDK (`e17081a`,
+ESP-IDF v6.0.3, `aipi` profile) plus the voice patch;
+`CONFIG_MUSE_TTS_GROQ=y` (default in the patch's Kconfig).
+**Flash it:** same 4-file esptool procedure as above; never `erase-flash`
+(NVS with token, pairing, Wi-Fi, and voice settings survives a normal
+flash). **Configure it:** over the serial console (115200 baud) with your
+own free Groq API key — the key is entered by you and never goes in this
+repo:
+
+```
+>voice={"url":"https://api.groq.com/openai/v1/audio/speech","model":"canopylabs/orpheus-v1-english","voice":"troy","key":"gsk_..."}
+```
+
+The box answers `@voice saved`. A bare `>voice=` prints URL, model, voice,
+and key-set status — **never the key**.
+
+Verified voice firmware hashes (build 2026-11-24):
+
+| File | Address | Size | SHA-256 |
+|---|---|---|---|
+| bootloader.bin | 0x0 | 22,752 | `4d65f4fb2782be4fb34f917e3dd2e97e500b9defdfa83b45a754d10db4c5cdf1` |
+| partition-table.bin | 0x10000 | 3,072 | `f1eed33f4d8c528ce6085b46abfeb3a176beefe71601330a81c1cc15fc58e08f` |
+| ota_data_initial.bin | 0x1d000 | 8,192 | `7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f` |
+| muse-gadget.bin | 0x20000 | 2,232,320 | `c2d65bd15241585f758e54d901086c8831012764a1e200fc1c62b0c7b8e877d9` |
+
+Zip SHA-256: `38bd15fadc30cfe0afc4652cf18dd5f3af17b44f7ac9a48c4335be962cefa58f`
+(1,489,004 bytes). Prebuilt binaries are **not** in this repo — build them
+with `build-voice.sh`. Note: ESP-IDF embeds the compile date/time in the
+app binary, so a fresh build differs from these hashes but is functionally
+identical (same sources, same sdkconfig — verified by rebuilding from
+`build-voice.sh` on 2026-11-24).
+
+**Limits:** Orpheus is WAV-only, 200 chars/request, ~100 requests/day on
+the free tier; a failed fetch fails soft to silent text. Groq model churn
+is the biggest non-technical risk (Groq already killed playai-tts) — if
+Orpheus is retired, change the model string with `>voice=`, no reflash
+needed. One global voice, no per-message selection yet. Way back:
+re-flash the multi-Wi-Fi-only firmware, or re-run
+`muse.aipi.com/setup.html` for official 1.0.4.
+
+Full documentation: `voice/VOICE_BUILD_REPORT.md` and
+`voice/VOICE_FIX_REPORT.md`. Laptop-side helpers (`voice/groq_test.py`,
+`voice/send_voice.py`, `voice/send_raw.py`) read the key from a local file
+and never print it.
 
 ## Way back
 
